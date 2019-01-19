@@ -3,6 +3,7 @@ layout: default
 title:  "Fisrt"
 date:   2016-02-12 17:50:00
 categories: main
+comments: true
 ---
 
 ## 우울한 날의 연속이다. 
