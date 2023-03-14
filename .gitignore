@@ -17,3 +17,10 @@ package-lock.json
 # IDE configurations
 .idea
 .vscode
+
+# add
+.sass-cache
+.jekyll-metadata
+
+README.md
+.DS_Store
