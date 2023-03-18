@@ -1,0 +1,214 @@
+---
+title: MySQL 트랜잭션과 잠금  
+author: Hyeon Uk Cho  
+date: 2023-03-17 15:30:00 +09:00  
+categories: [MySQL]  
+tags: [mysql, transaction, lock]  
+<!-- 
+math: true
+mermaid: true  
+image:  
+path: /commons/devices-mockup.png  
+lqip: data:image/webp;base64,UklGRpoAAABXRUJQVlA4WAoAAAAQAAAADwAABwAAQUxQSDIAAAARL0AmbZurmr57yyIiqE8oiG0bejIYEQTgqiDA9vqnsUSI6H+oAERp2HZ65qP/VIAWAFZQOCBCAAAA8AEAnQEqEAAIAAVAfCWkAALp8sF8rgRgAP7o9FDvMCkMde9PK7euH5M1m6VWoDXf2FkP3BqV0ZYbO6NA/VFIAAAA  
+alt: Responsive rendering of Chirpy theme on multiple devices.
+-->
+---
+
+## MySQL 트랜잭션과 잠금
+
+---
+
+<h3 data-toc-skip>주의사항</h3>
+시작부터 왠 주의사항인가 싶지만, 책에서 좋지 않은 케이스를 미리 말한다.
+1. 데이터베이스 커넥션 갯수 제한 등 자원이 제한적이기 때문에, 트랜잭션이 필요하지 않은 로직이 트랜잭션 범위에 포함되는 것을 주의
+2. 타 서버와의 통신 등 외부 인프라와 통신 로직을 포함하지 않도록 주의
+3. 반드시 트랜잭션을 묶어야하는 로직을 묶고 아니라면 별도 트랜잭션으로 분리하도록 주의
+
+<h3 data-toc-skip>MySQL 엔진의 잠금</h3>
+
+
+### Named Lock
+
+- GET_LOCK() 함수를 이용해 임의의 문자열에 대해 잠금을 설정할 수 있다.
+- 테이블이나 레코드 또는 AUTO_INCREMENT와 같은 데이터베이스 객체가 아니라 단순히 사용자가 지정한 문자열에 대해 흭득하고 반납하는 잠금.
+
+```sql
+select get_lock('mylock', 2) -- my_lock 에 대해 잠금 흭득, 이미 잠금 사용중이면 2초 대기
+select is_free_lock('mylock') -- 잠금여부 확인
+select release_lock('mylock') -- 잠금 반납
+select release_all_locks() -- 현재 세션에서 흭득한 네임드 락을 모두 해제
+```
+
+### Metadata Lock
+
+- 데이터베이스 객체의 이름이나 구조를 변경하는 경우에 흭득하는 잠금이다.
+- 해당 락은 명시적으로 흭득하거나 해제할 수 있는 것이 아니다.
+
+```sql
+RENAME TABLE tab_a TO tab_b -- 동시에 두개 다 걸림
+```
+
+```sql
+-- 배치 프로그램에서 별도의 임시테이블(rank_new)이 서비스용 랭킹 데이터를 생성
+-- 랭킹 배치가 완료되면 현재 서비스용 랭킹 테이블(rank)을 rank_backup으로 백업하고
+-- 새로 만들어진 랭킹 테이블(rank_new)을 서비스용으로 대체하고자 하는 경우
+RENAME TABLE rank TO rank_backup, rank_new to rank;
+-- 'Table not found 'rank'' 발생시키지 않고 적용 가능. 이 문장을 2개로 나누면 짦은 시간이나마 발생할 수 있음.
+```
+
+### 메타데이터 잠금과 InnoDB Transaction 동시 사용 경우
+
+```sql
+CREATE TABLE access_log (
+	id BIGINT NOT NULL AUTO_INCREMENT,
+	client_ip INT UNSIGNED,
+	access_dttm TIMESTAMP,
+...
+	PRIMARY KEY(id)
+);
+```
+
+어느날 테이블 변경 필요
+
+Online DDL 가능하지만 시간이 너무 오래 걸리는 경우, 언두로그 증가와 Online DDL이 실행되는 동안 누적된 Online DDL 버퍼의 크기 등 고민해야할 문제가 많다. 더 큰 문제는 Mysql의 DDL은 단일 스레드로 동작하기 때문에 많은 시간이 소요된다.
+
+이때는 새로운 구조의 테이블을 생성하고 먼저 최근 데이터까지는 프라이머리 키인 id값을 범위별로 나눠서 여러 개의 스레드로 빠르게 복사한다.
+
+```sql
+CREATE TABLE access_log_new (
+	id BIGINT NOT NULL AUTO_INCREMENT,
+	client_ip INT UNSIGNED,
+	access_dttm TIMESTAMP,
+...
+	PRIMARY KEY(id)
+) KEY_BLOCK_SIZE = 4;
+
+INSERT INTO access_log_new select * from access_log where id>=0 and id<10000;
+INSERT INTO access_log_new select * from access_log where id>=10000 and id<20000;
+INSERT INTO access_log_new select * from access_log where id>=20000 and id<30000;
+INSERT INTO access_log_new select * from access_log where id>=30000 and id<40000;
+```
+
+그리고 나머지 데이터는 다음과 같이 트랜잭션과 테이블 잠금, RENAME TABLE 명령으로 응용 프로그램의 중단 없이 실행이 가능하다. 이때 남은 데이터를 복사하는 시간동안은 테이블의 잠금으로 인해 INSERT 불가
+
+최대한 최근 데이터까지 복사해야 잠금 최소화, 서비스 영향도 최소화
+
+```sql
+set autocommit = 0; -- 트랜잭션을 autocommit 끄기
+lock tables access_log write, access_log_new write; -- Table Lock 얻기
+select max(id) as @MAX_ID from access_log_new;
+insert into access_log_new select * from access_log where pk > @MAX_ID;
+commit;
+
+rename table access_log to access_log_old, access_log_new to access_log;
+unlock tables;
+
+drop table access_log_old;
+```
+
+### InnoDB Storage Engine LOCK
+
+스토리지 엔진 내부에서 레코드 기반의 잠금 방식을 탑재.  
+InnoDB는 레코드 기반의 잠금 방식 때문에 MyISAM 보다는 훨씬 뛰어난 동시성 제공  
+하지만 이원화된 잠금 처리 탓에 InnoDB 스토리지 엔진에서 사용되는 잠금에 대한 정보는 Mysql 명령어를 이용해 접근하기가 상당히 까다롭다.
+잠금 정보가 상당히 작은 공간으로 관리되기 때문에 레코드 락이 페이지 락으로, 또는 테이블 락으로 레벨업되는 경우는 없다.
+
+### 레코드 락
+
+레코드 자체가 아닌 인덱스의 레코드를 잠근다.  
+인덱스가 하나도 없는 테이블이더라도 내부적으로 자동 생성된 클러스터 인덱스를 이용해 잠금을 설정한다.
+InnoDB에서는 대부분 보조 인덱스를 이용한 변경 작업은 이어서 설명할 넥스트 키 락 또는 갭락을 사용하지만 프라이머리 키 또는 유니크 인덱스에 의한 변경 작업에서는 갭에   
+대해서는 잠그지 않고 레코드 자체에 대해서만 락을 건다.
+
+- __질문) 실제 업무에서 primary key, index로 row lock을 걸면 (select for update) 실제 해당 데이터가 락이 걸리는 것이 아니라 pk or index가 lock이 걸리는 것인가?__
+
+### 갭 락
+
+레코드 자체가 아니라 레코드와 바로 인접한 레코드 사이의 간격만을 잠그는 것을 의미  
+갭 락의 역할은 레코드와 레코드 사이의 간격에 새로운 레코드 생성(INSERT)을 제어하는 것이다.
+갭 락은 그 자체보다는 넥스트 키 락의 일부로 사용된다.
+
+### 넥스트 키 락
+
+__레코드 락과 갭 락을 합쳐 놓은 형태의 잠금을 넥스트 키 락이라고 한다.__  
+STATEMENT 포맷의 바이너리 로그를 사용하는 MySQL 서버에서는 REPEATABLE READ 격리 수준을 이용해야 한다. 또한 innodb_locks_unsafe_for_binlog 시스템 변수가 비활성화되면(0으로 설정되면) 변경을 위해 검색하는 레코드의 넥스트 키 락 방식으로 잠금이 걸린다.  
+바이너리 로그에 기록되는 쿼리가 레플리카 서버에서 실행될 때 소스 서버에서 만들어 낸 결과와 동일한 결과를 만들어내도록 보장하는 것이 주목적이다.
+그런데 의외로 넥스트 키 락과 갭 락으로 인해 데드락이 발생하거나 다른 트랜잭션을 기다리게 만드는 일이 자주 발생한다. 가능하다면 바이너리 로그 포맷을 ROW 형태로 바꿔서 넥스트 키 락이나 갭 락을 줄이는 것이 좋다. MySQL 8.0 에서는 기본 설정이다.
+
+### 자동 증가 락
+
+InnoDB 스토리지 엔진에서는 이를 위해 내부적으로 AUTO_INCREMENT 락이라고 하는 테이블 수준의 잠금을 사용한다.  
+AUTO_INCREMENT 락은 INSERT와 REPLACE 쿼리 문장과 같은 새로운 레코드를 저장하는 쿼리에서만 필요하며, UPDATE와 DELETE 등의 쿼리에서는 걸리지 않는다. InnoDB의 다른 잠금(레코드, 넥스트 키)과는 달리 AUTO_INCREMENT 락은 트랜잭션과 관계없이 INSERT나 REPLACE 문장에서 AUTO_INCREMENT 값을 가져오는 순간만 락이 걸렸다가 즉시 해제된다.  
+AUTO_INCREMENT 락은 테이블에 단 하나만 존재하기 때문에 두개의 INSERT가 실행되면 기다려야 한다.  
+명시적 흭득 / 해제 방법 없음. 대부분의 경우 문제 안된다.  
+
+```sql
+innodb_autoinc_lock_mode=0
+-- 모든 INSERT 문장은 자동 증가 락 사용.
+innodb_autoinc_lock_mode=1
+-- 단순히 한 건 또는 여러 건의 레코드를 INSERT 하는 SQL 중에서 INSERT 되는 레코드의 건수를 
+-- 정확히 예측할 수 있을 때는 자동 증가 락을 사용하지 않고 훨씬 가볍고 빠른 뮤텍스를 이용해 처리한다.
+-- INSERT … SELECT와 같이 예측할 수 없을 때 사용. 완료되기 전까지 다른 세션에서 insert 불가.
+innodb_autoinc_lock_mode=2 -- 기본값
+-- 절대 자동 증가 락을 사용하지 않고 경량화된 래치(뮤텍스)를 사용.
+-- 이 설정에서 자동 증가 기능은 유니크한 값이 생성된다는 것만 보장. 
+-- STATEMENT 포맷의 바이너리 로그를 사용하는 복제에서는 소스 서버와 레플리카 서버의 
+-- 자동 증가 값이 달라질 수 있기 때문에 주의 필요.
+```
+
+### INDEX & LOCK
+
+InnoDB의 잠금은 레코드를 잠그는 것이 아니라 인덱스를  잠그는 방식으로 처리된다. 즉, 변경해야 할 레코드를 찾기 위해 검색한 인덱스의 레코드를 모두 락을 걸어야 한다.
+
+```sql
+-- employees 테이블에 인덱스는 first_name 컬럼만 잡혀 있다.
+-- KEY ix_firstname (first_name) 
+
+select count(*) from employees where first_name = 'Georgi';
+-- 253건
+select count(*) from employees where first_name = 'Georgi' and last_name = 'Klassen';
+-- 1건
+
+update employees set hire_date = now() where first_name = 'Georgi' and last_name = 'Klassen';
+-- 해당 update query는 1건이 업데이트 되지만 업데이트를 위해 253건에 해당하는 레코드를 락을 건다.
+-- last_name 에 대한 인덱스가 없기 때문에 ix_firstname 인덱스에 대해 모두 락을 건다.
+```
+
+### 레코드 수준의 잠금 확인 및 해제
+
+```sql
+show processlist;
+
+select 
+    r.trx_id waiting_trx_id,
+    r.trx_mysql_thread_id waiting_thread,
+    r.trx_query waiting_query,
+    b.trx_id blocking_id,
+    b.trx_mysql_thread_id blocking_thread,
+    b.trx_query blocking_query
+from performance_schema.data_lock_waits w
+         inner join information_schema.INNODB_TRX b on b.trx_id = w.BLOCKING_ENGINE_TRANSACTION_ID
+         inner join information_schema.INNODB_TRX r on r.trx_id = w.REQUESTING_ENGINE_TRANSACTION_ID
+;
+
+select * from performance_schema.data_locks
+;
+
+-- kill id
+kill 17
+;
+```
+
+### MySQL 격리 수준
+
+|  | DIRTY READ | NON-REPEATABLE READ | PHANTOM READ |
+| --- | --- | --- | --- |
+| READ UNCOMMITTED | Y | Y | Y |
+| READ COMMITTED | N | Y | Y |
+| REPEATABLE READ
+(항상 같은 값을 조회해야 함.) | N | N | Y(InnoDB 없음) |
+| SERIALIZABLE | N | N | N |
+
+검색해서 그림들을 보는 것이 빠름. Real MySQL 177 page
+
+- __질문) select … for update 는 lock을 걸어야하기 때문에 Undo 영역으로 안가고 레코드쪽으로 간다?__
