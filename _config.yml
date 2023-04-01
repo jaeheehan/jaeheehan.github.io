@@ -81,7 +81,7 @@ theme_mode: light  # [light|dark]
 img_cdn: 'https://jaeheehan.github.io'
 
 # the avatar on sidebar, support local or CORS resources
-avatar: '/assets/img/avatar.jpeg'
+avatar: '/assets/img/jaehee.jpeg'
 
 # boolean type, the global switch for ToC in posts.
 toc: true
